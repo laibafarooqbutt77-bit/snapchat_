@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import {
   Camera,
@@ -26,6 +26,8 @@ import {
   Scissors,
   Clock,
   User as UserIcon,
+  AlertCircle,
+  Loader2,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import {
@@ -41,6 +43,7 @@ type CaptureMedia = {
   type: 'photo' | 'video';
   blob: Blob;
   url: string;
+  mimeType?: string;
   duration?: number;
 };
 
@@ -53,6 +56,46 @@ type SnapSticker = {
 
 const DRAW_COLORS = ['#FFFC00', '#FFFFFF', '#EF4444', '#38BDF8', '#22C55E', '#A855F7', '#000000'];
 const QUICK_STICKERS = ['🔥', '⚡', '✨', '😍', '😂', '💀', '🌴', '🎉', '💯', '🫶', '🕶️', '🚀'];
+
+function getSupportedVideoMimeType(): string {
+  if (typeof MediaRecorder === 'undefined') return '';
+  const candidates = [
+    'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
+    'video/mp4',
+    'video/webm;codecs=vp9,opus',
+    'video/webm;codecs=vp8,opus',
+    'video/webm',
+  ];
+  for (const type of candidates) {
+    try {
+      if (MediaRecorder.isTypeSupported(type)) return type;
+    } catch {
+      // Ignore unsupported probe
+    }
+  }
+  return '';
+}
+
+function getCameraErrorMessage(err: unknown): string {
+  if (typeof window !== 'undefined' && !window.isSecureContext) {
+    return 'Camera requires HTTPS. Open this app over your Vercel HTTPS URL.';
+  }
+  const error = err as { name?: string; message?: string } | null;
+  const name = error?.name || '';
+  if (name === 'NotAllowedError' || name === 'PermissionDeniedError' || name === 'SecurityError') {
+    return 'Camera permission was denied. On iPhone Safari tap "aA" > Website Settings > Camera > Allow. On Android Chrome tap the lock/tune icon in the address bar > Permissions > Camera > Allow, then tap Retry.';
+  }
+  if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+    return 'No camera hardware was detected on this device. You can still upload photos or videos from your gallery.';
+  }
+  if (name === 'NotReadableError' || name === 'TrackStartError') {
+    return 'Your camera is currently in use by another app or tab. Close other camera apps and tap Retry.';
+  }
+  if (name === 'OverconstrainedError' || name === 'ConstraintNotSatisfiedError') {
+    return 'Requested camera lens is unavailable on this device. Tap Retry to use the default camera.';
+  }
+  return error?.message || 'Unable to access camera. Check browser permissions and tap Retry.';
+}
 
 export const CameraPage: React.FC = () => {
   const {
@@ -68,8 +111,9 @@ export const CameraPage: React.FC = () => {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
 
-  // Camera hardware state (never auto-starts without user gesture)
+  // Camera hardware state (never auto-starts without user interaction)
   const [cameraActive, setCameraActive] = useState(false);
+  const [cameraLoading, setCameraLoading] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [facingMode, setFacingMode] = useState<'user' | 'environment'>('user');
   const [flashOn, setFlashOn] = useState(false);
@@ -111,10 +155,13 @@ export const CameraPage: React.FC = () => {
   const previewCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const drawCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const audioStreamRef = useRef<MediaStream | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const isDrawingRef = useRef(false);
+  const isStartingRef = useRef(false);
+  const mountedRef = useRef(true);
   const detectedFaceRef = useRef<FaceBox | null>(null);
 
   const activeFilter = useMemo(
@@ -132,46 +179,239 @@ export const CameraPage: React.FC = () => {
     });
   }, [filterCat, filterSearch, state.favoriteFilterIds]);
 
-  const stopCamera = () => {
-    streamRef.current?.getTracks().forEach((t) => t.stop());
-    streamRef.current = null;
-    setCameraActive(false);
-  };
-
-  const startCamera = async (mode: 'user' | 'environment' = facingMode) => {
-    setCameraError(null);
-    if (!navigator.mediaDevices?.getUserMedia) {
-      setCameraError('Camera API unavailable in this browser. Use Studio Mode or Gallery Upload.');
-      return;
-    }
-    try {
-      stopCamera();
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: mode,
-          width: { ideal: 1080 },
-          height: { ideal: 1920 },
-        },
-        audio: captureMode === 'video',
+  const stopAllTracks = useCallback(() => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => {
+        try {
+          track.stop();
+        } catch {
+          // Ignore track stop errors
+        }
       });
-      streamRef.current = stream;
-      setCameraActive(true);
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        await videoRef.current.play().catch(() => {});
+      streamRef.current = null;
+    }
+    if (audioStreamRef.current) {
+      audioStreamRef.current.getTracks().forEach((track) => {
+        try {
+          track.stop();
+        } catch {
+          // Ignore track stop errors
+        }
+      });
+      audioStreamRef.current = null;
+    }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+  }, []);
+
+  const stopCamera = useCallback(() => {
+    stopAllTracks();
+    setCameraActive(false);
+    setCameraLoading(false);
+    setFlashOn(false);
+  }, [stopAllTracks]);
+
+  const attachStreamToVideo = useCallback(async (stream: MediaStream): Promise<void> => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    // Required mobile Safari & Android Chrome attributes
+    video.muted = true;
+    video.playsInline = true;
+    video.setAttribute('playsinline', 'true');
+    video.setAttribute('webkit-playsinline', 'true');
+    video.srcObject = stream;
+
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        video.removeEventListener('loadedmetadata', onReady);
+        video.removeEventListener('canplay', onReady);
+        resolve();
+      };
+      const onReady = () => {
+        video.play().catch(() => {}).finally(done);
+      };
+
+      if (video.readyState >= 1) {
+        onReady();
+      } else {
+        video.addEventListener('loadedmetadata', onReady);
+        video.addEventListener('canplay', onReady);
+        // Safety timeout so loading state can never hang forever
+        setTimeout(() => {
+          video.play().catch(() => {}).finally(done);
+        }, 1800);
+      }
+    });
+  }, []);
+
+  const startCamera = useCallback(
+    async (preferredMode: 'user' | 'environment' = facingMode) => {
+      if (isStartingRef.current) return;
+
+      if (typeof window !== 'undefined' && !window.isSecureContext) {
+        setCameraError('Camera requires an HTTPS connection (such as your deployed Vercel URL).');
+        return;
+      }
+
+      if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
+        setCameraError(
+          'Your browser does not support live camera access. Please update your browser or upload from gallery.'
+        );
+        return;
+      }
+
+      isStartingRef.current = true;
+      setCameraLoading(true);
+      setCameraError(null);
+
+      // Stop existing tracks BEFORE requesting a new camera (required on Android)
+      stopAllTracks();
+
+      const attemptConstraints: MediaStreamConstraints[] = [
+        // 1. Exact facingMode (helps iOS/Android reliably switch front/rear cameras)
+        {
+          video: {
+            facingMode: { exact: preferredMode },
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+          },
+          audio: false,
+        },
+        // 2. Ideal facingMode (smooth fallback for devices with a single camera)
+        {
+          video: {
+            facingMode: { ideal: preferredMode },
+          },
+          audio: false,
+        },
+        // 3. Generic default video camera fallback
+        {
+          video: true,
+          audio: false,
+        },
+      ];
+
+      let acquiredStream: MediaStream | null = null;
+      let lastError: unknown = null;
+
+      for (const constraints of attemptConstraints) {
+        try {
+          acquiredStream = await navigator.mediaDevices.getUserMedia(constraints);
+          if (acquiredStream) break;
+        } catch (err) {
+          lastError = err;
+          const errName = (err as { name?: string } | null)?.name || '';
+          // If permission explicitly denied or hardware locked, don't loop further
+          if (
+            errName === 'NotAllowedError' ||
+            errName === 'PermissionDeniedError' ||
+            errName === 'SecurityError' ||
+            errName === 'NotReadableError' ||
+            errName === 'TrackStartError'
+          ) {
+            break;
+          }
+        }
+      }
+
+      if (!mountedRef.current) {
+        acquiredStream?.getTracks().forEach((t) => t.stop());
+        isStartingRef.current = false;
+        return;
+      }
+
+      if (!acquiredStream) {
+        setCameraActive(false);
+        setCameraLoading(false);
+        setCameraError(getCameraErrorMessage(lastError));
+        isStartingRef.current = false;
+        return;
+      }
+
+      try {
+        streamRef.current = acquiredStream;
+
+        // Detect actual facingMode returned by device
+        const videoTrack = acquiredStream.getVideoTracks()[0];
+        const settings = videoTrack?.getSettings?.();
+        if (settings?.facingMode === 'user' || settings?.facingMode === 'environment') {
+          setFacingMode(settings.facingMode);
+        } else {
+          setFacingMode(preferredMode);
+        }
+
+        // Handle unexpected track end (e.g., OS revoked camera)
+        if (videoTrack) {
+          videoTrack.onended = () => {
+            if (mountedRef.current) {
+              setCameraActive(false);
+            }
+          };
+        }
+
+        setCameraActive(true);
+        await attachStreamToVideo(acquiredStream);
+        setCameraLoading(false);
+      } catch (err) {
+        stopAllTracks();
+        setCameraActive(false);
+        setCameraLoading(false);
+        setCameraError(getCameraErrorMessage(err));
+      } finally {
+        isStartingRef.current = false;
+      }
+    },
+    [facingMode, stopAllTracks, attachStreamToVideo]
+  );
+
+  // Re-attach live stream to <video> whenever returning from Snap Editor (Retake)
+  useEffect(() => {
+    if (!captured && cameraActive && streamRef.current && videoRef.current) {
+      if (videoRef.current.srcObject !== streamRef.current) {
+        attachStreamToVideo(streamRef.current);
+      }
+    }
+  }, [captured, cameraActive, attachStreamToVideo]);
+
+  // Cleanup camera streams on component unmount or page hide
+  useEffect(() => {
+    mountedRef.current = true;
+    const handlePageHide = () => stopAllTracks();
+    window.addEventListener('pagehide', handlePageHide);
+    return () => {
+      mountedRef.current = false;
+      window.removeEventListener('pagehide', handlePageHide);
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+        try {
+          mediaRecorderRef.current.stop();
+        } catch {
+          // Ignore recorder stop errors
+        }
+      }
+      stopAllTracks();
+    };
+  }, [stopAllTracks]);
+
+  // Apply real rear-camera hardware torch when flash is toggled
+  useEffect(() => {
+    const track = streamRef.current?.getVideoTracks()?.[0];
+    if (!track || facingMode !== 'environment') return;
+    try {
+      const caps = track.getCapabilities?.() as MediaTrackCapabilities & { torch?: boolean };
+      if (caps?.torch) {
+        track.applyConstraints({
+          advanced: [{ torch: flashOn } as MediaTrackConstraintSet],
+        }).catch(() => {});
       }
     } catch {
-      setCameraError('Camera permission denied or no webcam found. Studio Preview & Upload remain active.');
-      setCameraActive(false);
+      // Torch not supported on this browser/camera
     }
-  };
-
-  // Cleanup camera stream on unmount
-  useEffect(() => {
-    return () => {
-      streamRef.current?.getTracks().forEach((t) => t.stop());
-    };
-  }, []);
+  }, [flashOn, facingMode, cameraActive]);
 
   // Optional FaceDetector API polling when camera is active + lens chosen
   useEffect(() => {
@@ -205,14 +445,18 @@ export const CameraPage: React.FC = () => {
       } catch {
         // Fallback to center face anchor
       }
-    }, 180);
+    }, 200);
     return () => {
       alive = false;
       clearInterval(timer);
     };
   }, [cameraActive, activeFilter.lensType]);
 
-  // Real-time Canvas Render Loop (handles live camera OR interactive Studio Preview + Filters + Lenses)
+  // Overlay Canvas Render Loop (draws Canvas pixel effects or Face Lenses over the visible <video>)
+  const needsCanvasPixelDraw = Boolean(
+    activeFilter.canvasMode && activeFilter.canvasMode !== 'none'
+  );
+
   useEffect(() => {
     if (captured) return;
     let rafId = 0;
@@ -226,64 +470,34 @@ export const CameraPage: React.FC = () => {
           const h = canvas.height;
           ctx.clearRect(0, 0, w, h);
 
-          ctx.save();
-          if (activeFilter.cssFilter && activeFilter.cssFilter !== 'none') {
-            ctx.filter = activeFilter.cssFilter;
-          }
-
           const vid = videoRef.current;
-          if (cameraActive && vid && vid.readyState >= 2) {
-            const vw = vid.videoWidth || w;
-            const vh = vid.videoHeight || h;
-            const scale = Math.max(w / vw, h / vh) * zoom;
-            const dw = vw * scale;
-            const dh = vh * scale;
-            const dx = (w - dw) / 2;
-            const dy = (h - dh) / 2;
+          if (cameraActive && vid && vid.readyState >= 2 && vid.videoWidth > 0) {
+            if (needsCanvasPixelDraw) {
+              const vw = vid.videoWidth;
+              const vh = vid.videoHeight;
+              const scale = Math.max(w / vw, h / vh) * zoom;
+              const dw = vw * scale;
+              const dh = vh * scale;
+              const dx = (w - dw) / 2;
+              const dy = (h - dh) / 2;
 
-            ctx.save();
-            if (facingMode === 'user' && state.settings.mirrorFrontCam) {
-              ctx.translate(w, 0);
-              ctx.scale(-1, 1);
+              ctx.save();
+              if (activeFilter.cssFilter && activeFilter.cssFilter !== 'none') {
+                ctx.filter = activeFilter.cssFilter;
+              }
+              if (facingMode === 'user' && state.settings.mirrorFrontCam) {
+                ctx.translate(w, 0);
+                ctx.scale(-1, 1);
+              }
+              ctx.drawImage(vid, dx, dy, dw, dh);
+              ctx.restore();
+
+              applyCanvasPostEffect(ctx, w, h, activeFilter.canvasMode, timeMs, filterIntensity);
             }
-            ctx.drawImage(vid, dx, dy, dw, dh);
-            ctx.restore();
-          } else {
-            // Interactive Studio Preview Canvas (shows live filters & lenses clearly before camera permission)
-            const grad = ctx.createLinearGradient(0, 0, w, h);
-            grad.addColorStop(0, '#141414');
-            grad.addColorStop(0.5, '#1F1F23');
-            grad.addColorStop(1, '#09090B');
-            ctx.fillStyle = grad;
-            ctx.fillRect(0, 0, w, h);
-
-            // Ambient lighting bokeh circles
-            const t = timeMs * 0.001;
-            ctx.fillStyle = 'rgba(255, 252, 0, 0.08)';
-            ctx.beginPath();
-            ctx.arc(w * 0.25 + Math.sin(t) * 20, h * 0.28 + Math.cos(t) * 14, 90, 0, Math.PI * 2);
-            ctx.fill();
-            ctx.fillStyle = 'rgba(56, 189, 248, 0.08)';
-            ctx.beginPath();
-            ctx.arc(w * 0.75 + Math.cos(t * 0.8) * 18, h * 0.65, 110, 0, Math.PI * 2);
-            ctx.fill();
-
-            // Portrait silhouette guide so lenses align visually
-            ctx.fillStyle = '#27272A';
-            ctx.beginPath();
-            ctx.ellipse(w / 2, h * 0.43, w * 0.21, h * 0.16, 0, 0, Math.PI * 2);
-            ctx.fill();
-            ctx.beginPath();
-            ctx.ellipse(w / 2, h * 0.72, w * 0.34, h * 0.2, 0, Math.PI, 0);
-            ctx.fill();
           }
-          ctx.restore();
 
-          // Apply Advanced Canvas Post-Effects
-          applyCanvasPostEffect(ctx, w, h, activeFilter.canvasMode, timeMs, filterIntensity);
-
-          // Apply Face Lens Overlay
-          if (activeFilter.lensType) {
+          // Draw Face Lens Overlay cleanly over live camera (or standby preview)
+          if (cameraActive && activeFilter.lensType) {
             const faceBox: FaceBox = detectedFaceRef.current || {
               x: w * 0.28,
               y: h * 0.27,
@@ -306,6 +520,7 @@ export const CameraPage: React.FC = () => {
     zoom,
     activeFilter,
     filterIntensity,
+    needsCanvasPixelDraw,
     state.settings.mirrorFrontCam,
   ]);
 
@@ -326,18 +541,68 @@ export const CameraPage: React.FC = () => {
     recordRecentFilter(id);
   };
 
+  // Renders the live <video> + filter + lens onto a snapshot canvas and returns a Blob
   const capturePhotoNow = () => {
-    const canvas = previewCanvasRef.current;
-    if (!canvas) return;
+    if (!cameraActive || !videoRef.current || videoRef.current.readyState < 2 || !videoRef.current.videoWidth) {
+      showToast('Enable your live camera first or upload a photo.', 'error');
+      return;
+    }
+
     if (flashOn && facingMode === 'user') {
       setScreenFlash(true);
       setTimeout(() => setScreenFlash(false), 220);
     }
-    canvas.toBlob(
+
+    const vid = videoRef.current;
+    const out = document.createElement('canvas');
+    out.width = 720;
+    out.height = 1280;
+    const ctx = out.getContext('2d');
+    if (!ctx) return;
+
+    const vw = vid.videoWidth;
+    const vh = vid.videoHeight;
+    const scale = Math.max(out.width / vw, out.height / vh) * zoom;
+    const dw = vw * scale;
+    const dh = vh * scale;
+    const dx = (out.width - dw) / 2;
+    const dy = (out.height - dh) / 2;
+
+    ctx.save();
+    if (activeFilter.cssFilter && activeFilter.cssFilter !== 'none') {
+      ctx.filter = activeFilter.cssFilter;
+    }
+    if (facingMode === 'user' && state.settings.mirrorFrontCam) {
+      ctx.translate(out.width, 0);
+      ctx.scale(-1, 1);
+    }
+    ctx.drawImage(vid, dx, dy, dw, dh);
+    ctx.restore();
+
+    applyCanvasPostEffect(ctx, out.width, out.height, activeFilter.canvasMode, performance.now(), filterIntensity);
+
+    if (activeFilter.lensType) {
+      const faceBox: FaceBox = detectedFaceRef.current
+        ? {
+            x: (detectedFaceRef.current.x / 540) * out.width,
+            y: (detectedFaceRef.current.y / 960) * out.height,
+            width: (detectedFaceRef.current.width / 540) * out.width,
+            height: (detectedFaceRef.current.height / 960) * out.height,
+          }
+        : {
+            x: out.width * 0.28,
+            y: out.height * 0.27,
+            width: out.width * 0.44,
+            height: out.height * 0.32,
+          };
+      drawLensOverlay(ctx, activeFilter.lensType, faceBox, performance.now(), filterIntensity);
+    }
+
+    out.toBlob(
       (blob) => {
         if (!blob) return;
         const url = URL.createObjectURL(blob);
-        setCaptured({ type: 'photo', blob, url });
+        setCaptured({ type: 'photo', blob, url, mimeType: 'image/jpeg' });
         setCaptionText('');
         setStickers([]);
         setEditorTool('none');
@@ -347,41 +612,92 @@ export const CameraPage: React.FC = () => {
     );
   };
 
-  const toggleVideoRecording = () => {
+  const toggleVideoRecording = async () => {
     if (isRecording) {
-      mediaRecorderRef.current?.stop();
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+        mediaRecorderRef.current.stop();
+      }
       setIsRecording(false);
       return;
     }
-    const canvas = previewCanvasRef.current;
-    if (!canvas || typeof MediaRecorder === 'undefined') {
-      showToast('Video recording unsupported in this browser', 'error');
+
+    if (!cameraActive || !streamRef.current) {
+      showToast('Enable your live camera first to record a video.', 'error');
       return;
     }
+
+    if (typeof MediaRecorder === 'undefined') {
+      showToast('Video recording is not supported in this browser.', 'error');
+      return;
+    }
+
     try {
-      const canvasStream = canvas.captureStream(30);
-      if (streamRef.current) {
-        streamRef.current.getAudioTracks().forEach((t) => canvasStream.addTrack(t));
+      // Request optional microphone audio track for video recording (never blocks video if denied)
+      let combinedStream: MediaStream;
+      let audioTrack: MediaStreamTrack | null = null;
+      try {
+        const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        audioStreamRef.current = micStream;
+        audioTrack = micStream.getAudioTracks()[0] || null;
+      } catch {
+        // Proceed with silent video recording if mic is unavailable/denied
       }
+
+      const canvas = previewCanvasRef.current;
+      const shouldUseCanvasStream =
+        (needsCanvasPixelDraw || Boolean(activeFilter.lensType)) &&
+        canvas &&
+        typeof canvas.captureStream === 'function';
+
+      if (shouldUseCanvasStream && canvas) {
+        // Ensure full video frame is on canvas when lens-only
+        const cStream = canvas.captureStream(30);
+        const tracks = [...cStream.getVideoTracks()];
+        if (audioTrack) tracks.push(audioTrack);
+        combinedStream = new MediaStream(tracks);
+      } else {
+        const tracks = [...streamRef.current.getVideoTracks()];
+        if (audioTrack) tracks.push(audioTrack);
+        combinedStream = new MediaStream(tracks);
+      }
+
+      const preferredMime = getSupportedVideoMimeType();
+      const recorder = preferredMime
+        ? new MediaRecorder(combinedStream, { mimeType: preferredMime })
+        : new MediaRecorder(combinedStream);
+
       recordedChunksRef.current = [];
-      const recorder = new MediaRecorder(canvasStream);
       recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) recordedChunksRef.current.push(e.data);
+        if (e.data && e.data.size > 0) recordedChunksRef.current.push(e.data);
       };
       recorder.onstop = () => {
-        const blob = new Blob(recordedChunksRef.current, { type: 'video/webm' });
+        const finalMime = recorder.mimeType || preferredMime || 'video/mp4';
+        const blob = new Blob(recordedChunksRef.current, { type: finalMime });
         const url = URL.createObjectURL(blob);
-        setCaptured({ type: 'video', blob, url, duration: Math.max(1, recordSec) });
+        audioStreamRef.current?.getTracks().forEach((t) => t.stop());
+        audioStreamRef.current = null;
+        setCaptured({
+          type: 'video',
+          blob,
+          url,
+          mimeType: finalMime,
+          duration: Math.max(1, recordSec),
+        });
       };
-      recorder.start(200);
+
+      recorder.start(250);
       mediaRecorderRef.current = recorder;
       setIsRecording(true);
     } catch {
-      showToast('Unable to start video recording', 'error');
+      showToast('Unable to start video recording on this device.', 'error');
     }
   };
 
   const handleShutterPress = () => {
+    if (!cameraActive) {
+      startCamera(facingMode);
+      return;
+    }
     if (captureMode === 'video') {
       toggleVideoRecording();
       return;
@@ -404,6 +720,16 @@ export const CameraPage: React.FC = () => {
     }, 1000);
   };
 
+  const handleSwitchCamera = () => {
+    if (cameraLoading || isStartingRef.current) return;
+    const nextMode = facingMode === 'user' ? 'environment' : 'user';
+    setFacingMode(nextMode);
+    setFlashOn(false);
+    if (cameraActive) {
+      startCamera(nextMode);
+    }
+  };
+
   const handleGalleryUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -418,6 +744,7 @@ export const CameraPage: React.FC = () => {
       type: isVideo ? 'video' : 'photo',
       blob: file,
       url,
+      mimeType: file.type,
     });
     e.target.value = '';
   };
@@ -464,7 +791,6 @@ export const CameraPage: React.FC = () => {
     if (canvas && ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
   };
 
-  // Composite final photo with drawings + caption + stickers
   const buildCompositeBlob = async (): Promise<Blob> => {
     if (!captured) throw new Error('No media');
     if (captured.type === 'video') return captured.blob;
@@ -519,9 +845,15 @@ export const CameraPage: React.FC = () => {
     if (!captured) return;
     const finalBlob = await buildCompositeBlob();
     const url = URL.createObjectURL(finalBlob);
+    const ext =
+      captured.type === 'video'
+        ? captured.mimeType?.includes('mp4')
+          ? 'mp4'
+          : 'webm'
+        : 'jpg';
     const a = document.createElement('a');
     a.href = url;
-    a.download = `lumo-snap-${Date.now()}.${captured.type === 'video' ? 'webm' : 'jpg'}`;
+    a.download = `lumo-snap-${Date.now()}.${ext}`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
     showToast('Saved to device!', 'yellow');
@@ -569,7 +901,7 @@ export const CameraPage: React.FC = () => {
   // POST-CAPTURE SNAP EDITOR VIEW
   if (captured) {
     return (
-      <div className="relative h-full w-full bg-black flex flex-col items-center justify-center overflow-hidden select-none">
+      <div className="relative h-full w-full bg-black flex flex-col items-center justify-center overflow-hidden select-none touch-none">
         <div className="relative w-full h-full max-w-md mx-auto bg-black overflow-hidden lg:my-3 lg:rounded-3xl lg:border lg:border-[#292929]">
           {captured.type === 'photo' ? (
             <img
@@ -917,19 +1249,33 @@ export const CameraPage: React.FC = () => {
     );
   }
 
+  const videoTransform = `${facingMode === 'user' && state.settings.mirrorFrontCam ? 'scaleX(-1) ' : ''}scale(${zoom})`;
+
   // LIVE CAMERA & FILTER STUDIO VIEW
   return (
-    <div className="relative h-full w-full bg-black flex flex-col items-center justify-center overflow-hidden">
+    <div className="relative h-full w-full bg-black flex flex-col items-center justify-center overflow-hidden touch-none overscroll-none select-none">
       <div className="relative w-full h-full max-w-[460px] lg:max-w-[520px] lg:h-[calc(100%-24px)] lg:rounded-3xl lg:border lg:border-[#292929] overflow-hidden bg-[#0A0A0A] shadow-2xl">
-        {/* Hidden Video Element feeding Canvas */}
-        <video ref={videoRef} playsInline muted className="hidden" />
+        {/* Visible Native Video Element (never display:none so iOS Safari & Android Chrome decode frames cleanly) */}
+        <video
+          ref={videoRef}
+          autoPlay
+          muted
+          playsInline
+          className={`absolute inset-0 w-full h-full object-cover transition-opacity duration-200 ${
+            cameraActive ? 'opacity-100' : 'opacity-0 pointer-events-none'
+          }`}
+          style={{
+            filter: activeFilter.cssFilter !== 'none' ? activeFilter.cssFilter : undefined,
+            transform: videoTransform,
+          }}
+        />
 
-        {/* Live Filtered Canvas */}
+        {/* Transparent Overlay Canvas for Advanced Pixel Effects & Face Lenses */}
         <canvas
           ref={previewCanvasRef}
           width={540}
           height={960}
-          className="w-full h-full object-cover"
+          className="absolute inset-0 w-full h-full object-cover pointer-events-none"
         />
 
         {/* Grid Overlay */}
@@ -977,7 +1323,7 @@ export const CameraPage: React.FC = () => {
             {cameraActive && (
               <div className="px-2.5 py-1 rounded-full bg-black/65 border border-[#FFFC00]/40 text-[11px] font-bold text-[#FFFC00] flex items-center gap-1.5">
                 <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
-                {isRecording ? `REC ${recordSec}s` : 'LIVE CAM'}
+                {isRecording ? `REC ${recordSec}s` : facingMode === 'user' ? 'FRONT CAM' : 'REAR CAM'}
               </div>
             )}
           </div>
@@ -985,20 +1331,17 @@ export const CameraPage: React.FC = () => {
           {/* Right Vertical Camera Toolbar */}
           <div className="flex flex-col items-center gap-2 bg-black/45 backdrop-blur-md border border-white/10 rounded-full p-1.5">
             <button
-              onClick={() => {
-                const next = facingMode === 'user' ? 'environment' : 'user';
-                setFacingMode(next);
-                if (cameraActive) startCamera(next);
-              }}
-              className="w-9 h-9 rounded-full flex items-center justify-center text-white hover:bg-white/10"
+              onClick={handleSwitchCamera}
+              disabled={cameraLoading}
+              className="w-10 h-10 rounded-full flex items-center justify-center text-white hover:bg-white/10 disabled:opacity-50"
               aria-label="Flip camera"
-              title="Flip Camera"
+              title="Switch Front / Back Camera"
             >
-              <RefreshCw className="w-4 h-4" />
+              <RefreshCw className={`w-4 h-4 ${cameraLoading ? 'animate-spin' : ''}`} />
             </button>
             <button
               onClick={() => setFlashOn((f) => !f)}
-              className={`w-9 h-9 rounded-full flex items-center justify-center hover:bg-white/10 ${
+              className={`w-10 h-10 rounded-full flex items-center justify-center hover:bg-white/10 ${
                 flashOn ? 'text-[#FFFC00]' : 'text-white'
               }`}
               aria-label="Toggle flash"
@@ -1008,7 +1351,7 @@ export const CameraPage: React.FC = () => {
             </button>
             <button
               onClick={() => setGridOn((g) => !g)}
-              className={`w-9 h-9 rounded-full flex items-center justify-center hover:bg-white/10 ${
+              className={`w-10 h-10 rounded-full flex items-center justify-center hover:bg-white/10 ${
                 gridOn ? 'text-[#FFFC00]' : 'text-white'
               }`}
               aria-label="Toggle grid"
@@ -1020,7 +1363,7 @@ export const CameraPage: React.FC = () => {
               onClick={() =>
                 setTimerSec((t) => (t === 0 ? 3 : t === 3 ? 5 : t === 5 ? 10 : 0))
               }
-              className={`w-9 h-9 rounded-full flex items-center justify-center text-[11px] font-bold hover:bg-white/10 ${
+              className={`w-10 h-10 rounded-full flex items-center justify-center text-[11px] font-bold hover:bg-white/10 ${
                 timerSec > 0 ? 'text-[#FFFC00]' : 'text-white'
               }`}
               aria-label="Countdown timer"
@@ -1030,7 +1373,7 @@ export const CameraPage: React.FC = () => {
             </button>
             <button
               onClick={() => setShowFilterDrawer((v) => !v)}
-              className={`w-9 h-9 rounded-full flex items-center justify-center hover:bg-white/10 ${
+              className={`w-10 h-10 rounded-full flex items-center justify-center hover:bg-white/10 ${
                 showFilterDrawer ? 'text-[#FFFC00]' : 'text-white'
               }`}
               aria-label="Filter settings"
@@ -1041,22 +1384,63 @@ export const CameraPage: React.FC = () => {
           </div>
         </div>
 
-        {/* Center Camera Activation Prompt (Explicit User Gesture Required) */}
-        {!cameraActive && (
-          <div className="absolute inset-x-6 top-1/2 -translate-y-1/2 z-10 flex flex-col items-center text-center pointer-events-auto">
-            <div className="p-4 rounded-2xl bg-black/70 backdrop-blur-md border border-[#292929] max-w-xs space-y-3">
-              <p className="text-xs font-semibold text-[#FFFC00]">Studio Preview Active</p>
-              <p className="text-xs text-[#A1A1A1] leading-relaxed">
-                {cameraError ||
-                  'Activate your live camera to record snaps with 37 real-time filters & face lenses, or upload from gallery.'}
-              </p>
-              <button
-                onClick={() => startCamera(facingMode)}
-                className="w-full h-10 rounded-xl bg-[#FFFC00] text-black text-xs font-bold flex items-center justify-center gap-2 hover:brightness-95 transition"
-              >
-                <Camera className="w-4 h-4" />
-                Enable Live Camera
-              </button>
+        {/* Camera Loading State */}
+        {cameraLoading && (
+          <div className="absolute inset-0 z-20 bg-black/75 backdrop-blur-sm flex flex-col items-center justify-center gap-3 p-6 text-center">
+            <Loader2 className="w-9 h-9 text-[#FFFC00] animate-spin" />
+            <p className="text-sm font-bold text-white">Starting camera...</p>
+            <p className="text-xs text-[#A1A1A1]">Approve browser camera permission if prompted.</p>
+          </div>
+        )}
+
+        {/* User-Initiated Camera Activation / Permission Error Card */}
+        {!cameraActive && !cameraLoading && (
+          <div className="absolute inset-x-5 top-1/2 -translate-y-1/2 z-10 flex flex-col items-center text-center pointer-events-auto">
+            <div className="p-5 rounded-3xl bg-[#101010]/95 backdrop-blur-md border border-[#292929] max-w-xs w-full space-y-3.5 shadow-2xl">
+              {cameraError ? (
+                <>
+                  <div className="w-11 h-11 rounded-2xl bg-red-500/15 border border-red-500/30 flex items-center justify-center mx-auto text-red-400">
+                    <AlertCircle className="w-5 h-5" />
+                  </div>
+                  <p className="text-sm font-bold text-white">Camera Unavailable</p>
+                  <p className="text-xs text-[#A1A1A1] leading-relaxed">{cameraError}</p>
+                  <div className="flex flex-col gap-2">
+                    <button
+                      onClick={() => startCamera(facingMode)}
+                      className="w-full h-11 rounded-xl bg-[#FFFC00] text-black text-xs font-bold flex items-center justify-center gap-2 hover:brightness-95 transition"
+                    >
+                      <RefreshCw className="w-4 h-4" />
+                      Retry Camera
+                    </button>
+                    <button
+                      onClick={() => fileInputRef.current?.click()}
+                      className="w-full h-10 rounded-xl bg-[#181818] border border-[#292929] text-white text-xs font-semibold flex items-center justify-center gap-2"
+                    >
+                      <ImageIcon className="w-4 h-4" />
+                      Upload From Gallery
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="w-12 h-12 rounded-2xl bg-[#FFFC00] text-black flex items-center justify-center mx-auto">
+                    <Camera className="w-6 h-6" />
+                  </div>
+                  <div>
+                    <p className="text-sm font-bold text-white">Camera Ready</p>
+                    <p className="text-xs text-[#A1A1A1] leading-relaxed mt-1">
+                      Tap below to activate your device&apos;s live camera for photos, videos, and lenses.
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => startCamera(facingMode)}
+                    className="w-full h-11 rounded-xl bg-[#FFFC00] text-black text-xs font-bold flex items-center justify-center gap-2 hover:brightness-95 transition"
+                  >
+                    <Camera className="w-4 h-4" />
+                    Enable Live Camera
+                  </button>
+                </>
+              )}
             </div>
           </div>
         )}
@@ -1104,7 +1488,7 @@ export const CameraPage: React.FC = () => {
               placeholder="Search 37 filters & lenses..."
               className="w-full h-9 px-3 rounded-xl bg-[#181818] border border-[#292929] text-xs text-white focus:outline-none focus:border-[#FFFC00]"
             />
-            <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar">
+            <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar touch-pan-x">
               {(['all', 'lens', 'advanced', 'basic', 'favorites'] as const).map((cat) => (
                 <button
                   key={cat}
@@ -1145,7 +1529,7 @@ export const CameraPage: React.FC = () => {
           </div>
 
           {/* Horizontal Filter Strip */}
-          <div className="w-full flex items-center gap-2 overflow-x-auto no-scrollbar px-2 py-1">
+          <div className="w-full flex items-center gap-2 overflow-x-auto no-scrollbar touch-pan-x px-2 py-1">
             {filteredPresets.map((f) => {
               const selected = f.id === activeFilterId;
               return (
@@ -1198,8 +1582,15 @@ export const CameraPage: React.FC = () => {
 
             <button
               onClick={handleShutterPress}
-              aria-label={captureMode === 'video' ? 'Record video' : 'Capture photo'}
-              className={`w-20 h-20 rounded-full border-4 flex items-center justify-center transition-transform active:scale-95 ${
+              disabled={cameraLoading}
+              aria-label={
+                !cameraActive
+                  ? 'Enable Camera'
+                  : captureMode === 'video'
+                    ? 'Record video'
+                    : 'Capture photo'
+              }
+              className={`w-20 h-20 rounded-full border-4 flex items-center justify-center transition-transform active:scale-95 disabled:opacity-50 ${
                 isRecording
                   ? 'border-red-500 bg-red-500/20'
                   : captureMode === 'video'
@@ -1229,10 +1620,10 @@ export const CameraPage: React.FC = () => {
           {cameraActive && (
             <button
               onClick={stopCamera}
-              className="text-[11px] font-semibold text-[#A1A1A1] hover:text-white flex items-center gap-1"
+              className="text-[11px] font-semibold text-[#A1A1A1] hover:text-white flex items-center gap-1 py-1"
             >
               <RotateCcw className="w-3 h-3" />
-              Pause Camera
+              Stop Camera
             </button>
           )}
         </div>

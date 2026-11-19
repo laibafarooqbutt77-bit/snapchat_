@@ -64,10 +64,18 @@ export const ActiveCallOverlay: React.FC = () => {
           });
         }
         if (navigator.mediaDevices?.getUserMedia) {
-          const stream = await navigator.mediaDevices.getUserMedia({
-            audio: true,
-            video: activeCall.mode === 'video' ? { facingMode } : false,
-          });
+          let stream: MediaStream;
+          try {
+            stream = await navigator.mediaDevices.getUserMedia({
+              audio: true,
+              video: activeCall.mode === 'video' ? { facingMode: { ideal: facingMode } } : false,
+            });
+          } catch {
+            stream = await navigator.mediaDevices.getUserMedia({
+              audio: true,
+              video: activeCall.mode === 'video',
+            });
+          }
           if (!active) {
             stream.getTracks().forEach((t) => t.stop());
             return;
@@ -78,7 +86,10 @@ export const ActiveCallOverlay: React.FC = () => {
             stream.getTracks().forEach((t) => pcRef.current?.addTrack(t, stream));
           }
           if (localVideoRef.current && activeCall.mode === 'video') {
+            localVideoRef.current.muted = true;
+            localVideoRef.current.playsInline = true;
             localVideoRef.current.srcObject = stream;
+            localVideoRef.current.play().catch(() => {});
           }
         }
       } catch {
@@ -107,6 +118,17 @@ export const ActiveCallOverlay: React.FC = () => {
     if (!streamRef.current) return;
     streamRef.current.getVideoTracks().forEach((t) => (t.enabled = camEnabled));
   }, [camEnabled]);
+
+  useEffect(() => {
+    if (hasLocalStream && camEnabled && localVideoRef.current && streamRef.current) {
+      localVideoRef.current.muted = true;
+      localVideoRef.current.playsInline = true;
+      if (localVideoRef.current.srcObject !== streamRef.current) {
+        localVideoRef.current.srcObject = streamRef.current;
+      }
+      localVideoRef.current.play().catch(() => {});
+    }
+  }, [hasLocalStream, camEnabled]);
 
   if (!activeCall || !participant) return null;
 

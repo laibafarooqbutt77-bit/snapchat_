@@ -123,7 +123,7 @@ export const AppShell: React.FC<{ children: React.ReactNode }> = ({ children }) 
   };
 
   return (
-    <div className="min-h-screen h-screen bg-black text-white flex overflow-hidden">
+    <div className="min-h-[100dvh] h-[100dvh] bg-black text-white flex overflow-hidden">
       {/* Desktop Left Navigation Rail */}
       <aside className="hidden lg:flex flex-col w-64 shrink-0 border-r border-[#292929] bg-[#080808] p-4 justify-between">
         <div className="space-y-4 overflow-y-auto no-scrollbar">
