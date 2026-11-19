@@ -28,6 +28,8 @@ import {
   User as UserIcon,
   AlertCircle,
   Loader2,
+  ChevronDown,
+  ChevronUp,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import {
@@ -54,6 +56,32 @@ type SnapSticker = {
   y: number;
 };
 
+type CameraDiagnostics = {
+  isSecureContext: boolean;
+  mediaDevicesAvailable: boolean;
+  getUserMediaAvailable: boolean;
+  permissionState: string;
+  cameraCount: number | null;
+  streamActive: boolean | null;
+  trackState: string | null;
+  trackLabel: string | null;
+  readyState: number | null;
+  videoWidth: number | null;
+  videoHeight: number | null;
+  errorName: string | null;
+  errorMessage: string | null;
+  playbackError: string | null;
+};
+
+type VideoAttachResult = {
+  ok: boolean;
+  streamActive: boolean;
+  readyState: number;
+  videoWidth: number;
+  videoHeight: number;
+  playbackError: string | null;
+};
+
 const DRAW_COLORS = ['#FFFC00', '#FFFFFF', '#EF4444', '#38BDF8', '#22C55E', '#A855F7', '#000000'];
 const QUICK_STICKERS = ['🔥', '⚡', '✨', '😍', '😂', '💀', '🌴', '🎉', '💯', '🫶', '🕶️', '🚀'];
 
@@ -76,25 +104,34 @@ function getSupportedVideoMimeType(): string {
   return '';
 }
 
-function getCameraErrorMessage(err: unknown): string {
+function getCameraErrorMessage(err: unknown, playbackError?: string | null): string {
   if (typeof window !== 'undefined' && !window.isSecureContext) {
-    return 'Camera requires HTTPS. Open this app over your Vercel HTTPS URL.';
+    return 'Camera requires an HTTPS connection. Open this app via your deployed HTTPS URL.';
+  }
+  if (playbackError) {
+    return `Camera stream opened, but live video playback could not start (${playbackError}). Tap Retry Camera.`;
   }
   const error = err as { name?: string; message?: string } | null;
   const name = error?.name || '';
   if (name === 'NotAllowedError' || name === 'PermissionDeniedError' || name === 'SecurityError') {
-    return 'Camera permission was denied. On iPhone Safari tap "aA" > Website Settings > Camera > Allow. On Android Chrome tap the lock/tune icon in the address bar > Permissions > Camera > Allow, then tap Retry.';
+    return 'Camera permission was denied. On iPhone Safari tap "aA" > Website Settings > Camera > Allow. On Android Chrome tap the lock/tune icon in the address bar > Permissions > Camera > Allow, then tap Retry Camera.';
   }
   if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
-    return 'No camera hardware was detected on this device. You can still upload photos or videos from your gallery.';
+    return 'No camera hardware was detected on this device. Check device camera settings or upload from your gallery.';
   }
   if (name === 'NotReadableError' || name === 'TrackStartError') {
-    return 'Your camera is currently in use by another app or tab. Close other camera apps and tap Retry.';
+    return 'Your camera is already in use by another app, tab, or system process. Close other apps using the camera and tap Retry Camera.';
   }
   if (name === 'OverconstrainedError' || name === 'ConstraintNotSatisfiedError') {
-    return 'Requested camera lens is unavailable on this device. Tap Retry to use the default camera.';
+    return 'The requested camera lens or resolution is not supported on this device. Tap Retry Camera to fall back to the default camera.';
   }
-  return error?.message || 'Unable to access camera. Check browser permissions and tap Retry.';
+  if (name === 'AbortError') {
+    return 'Camera startup was interrupted before video could begin. Tap Retry Camera.';
+  }
+  if (name === 'TypeError') {
+    return 'Invalid camera request or unsupported browser context. Ensure you are on HTTPS and tap Retry Camera.';
+  }
+  return error?.message || 'Unable to start live camera preview. Check permissions and tap Retry Camera.';
 }
 
 export const CameraPage: React.FC = () => {
@@ -115,6 +152,8 @@ export const CameraPage: React.FC = () => {
   const [cameraActive, setCameraActive] = useState(false);
   const [cameraLoading, setCameraLoading] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
+  const [cameraDiagnostics, setCameraDiagnostics] = useState<CameraDiagnostics | null>(null);
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [facingMode, setFacingMode] = useState<'user' | 'environment'>('user');
   const [flashOn, setFlashOn] = useState(false);
   const [zoom, setZoom] = useState(1);
@@ -162,6 +201,8 @@ export const CameraPage: React.FC = () => {
   const isDrawingRef = useRef(false);
   const isStartingRef = useRef(false);
   const mountedRef = useRef(true);
+  const facingModeRef = useRef<'user' | 'environment'>('user');
+  const currentDeviceIdRef = useRef<string | null>(null);
   const detectedFaceRef = useRef<FaceBox | null>(null);
 
   const activeFilter = useMemo(
@@ -201,8 +242,14 @@ export const CameraPage: React.FC = () => {
       audioStreamRef.current = null;
     }
     if (videoRef.current) {
+      try {
+        videoRef.current.pause();
+      } catch {
+        // Ignore pause error
+      }
       videoRef.current.srcObject = null;
     }
+    currentDeviceIdRef.current = null;
   }, []);
 
   const stopCamera = useCallback(() => {
@@ -212,55 +259,208 @@ export const CameraPage: React.FC = () => {
     setFlashOn(false);
   }, [stopAllTracks]);
 
-  const attachStreamToVideo = useCallback(async (stream: MediaStream): Promise<void> => {
-    const video = videoRef.current;
-    if (!video) return;
+  const collectDiagnostics = useCallback(
+    async (extra?: Partial<CameraDiagnostics>): Promise<CameraDiagnostics> => {
+      const isSecure = typeof window !== 'undefined' ? window.isSecureContext : false;
+      const hasMediaDevices = typeof navigator !== 'undefined' && Boolean(navigator.mediaDevices);
+      const hasGetUserMedia =
+        hasMediaDevices && typeof navigator.mediaDevices.getUserMedia === 'function';
 
-    // Required mobile Safari & Android Chrome attributes
+      let permissionState = 'unsupported';
+      try {
+        if (navigator.permissions?.query) {
+          const status = await navigator.permissions.query({
+            name: 'camera' as PermissionName,
+          });
+          permissionState = status.state;
+        }
+      } catch {
+        permissionState = 'unavailable (Safari/WebKit)';
+      }
+
+      let cameraCount: number | null = null;
+      try {
+        if (hasMediaDevices && typeof navigator.mediaDevices.enumerateDevices === 'function') {
+          const devices = await navigator.mediaDevices.enumerateDevices();
+          cameraCount = devices.filter((d) => d.kind === 'videoinput').length;
+        }
+      } catch {
+        cameraCount = null;
+      }
+
+      const stream = streamRef.current;
+      const track = stream?.getVideoTracks?.()?.[0];
+      const video = videoRef.current;
+
+      const diag: CameraDiagnostics = {
+        isSecureContext: isSecure,
+        mediaDevicesAvailable: hasMediaDevices,
+        getUserMediaAvailable: hasGetUserMedia,
+        permissionState,
+        cameraCount,
+        streamActive: stream ? stream.active : null,
+        trackState: track ? track.readyState : null,
+        trackLabel: track ? track.label || 'video-track' : null,
+        readyState: video ? video.readyState : null,
+        videoWidth: video ? video.videoWidth : null,
+        videoHeight: video ? video.videoHeight : null,
+        errorName: null,
+        errorMessage: null,
+        playbackError: null,
+        ...extra,
+      };
+
+      console.info('[Lumo Camera Diagnostics]', diag);
+      return diag;
+    },
+    []
+  );
+
+  const attachStreamToVideo = useCallback(async (stream: MediaStream): Promise<VideoAttachResult> => {
+    const video = videoRef.current;
+    if (!video) {
+      return {
+        ok: false,
+        streamActive: stream.active,
+        readyState: 0,
+        videoWidth: 0,
+        videoHeight: 0,
+        playbackError: 'Video element not mounted',
+      };
+    }
+
+    // Critical mobile Safari & Android Chrome attributes before assigning srcObject
+    video.autoplay = true;
     video.muted = true;
+    video.defaultMuted = true;
     video.playsInline = true;
+    video.setAttribute('autoplay', '');
+    video.setAttribute('muted', '');
     video.setAttribute('playsinline', 'true');
     video.setAttribute('webkit-playsinline', 'true');
-    video.srcObject = stream;
 
-    await new Promise<void>((resolve) => {
+    if (video.srcObject !== stream) {
+      video.srcObject = null;
+      video.srcObject = stream;
+    }
+
+    let lastPlaybackError: string | null = null;
+    const tryPlay = async () => {
+      try {
+        await video.play();
+        lastPlaybackError = null;
+      } catch (err) {
+        const errObj = err as { name?: string; message?: string } | null;
+        const msg = errObj ? `${errObj.name || 'PlayError'}: ${errObj.message || ''}` : 'play() rejected';
+        // Ignore transient AbortError when srcObject/metadata triggers a newer play()
+        if (errObj?.name !== 'AbortError') {
+          lastPlaybackError = msg;
+          console.warn('[Lumo Camera] video.play() warning:', msg);
+        }
+      }
+    };
+
+    // Call play() immediately while still as close as possible to the user gesture
+    void tryPlay();
+
+    return await new Promise<VideoAttachResult>((resolve) => {
       let settled = false;
-      const done = () => {
+      let pollId: ReturnType<typeof setInterval> | null = null;
+      let timeoutId: ReturnType<typeof setTimeout> | null = null;
+
+      const cleanup = () => {
+        video.removeEventListener('loadedmetadata', handleEvent);
+        video.removeEventListener('loadeddata', handleEvent);
+        video.removeEventListener('canplay', handleEvent);
+        video.removeEventListener('playing', handleEvent);
+        video.removeEventListener('resize', handleEvent);
+        if (pollId) clearInterval(pollId);
+        if (timeoutId) clearTimeout(timeoutId);
+      };
+
+      const finish = (ok: boolean) => {
         if (settled) return;
         settled = true;
-        video.removeEventListener('loadedmetadata', onReady);
-        video.removeEventListener('canplay', onReady);
-        resolve();
-      };
-      const onReady = () => {
-        video.play().catch(() => {}).finally(done);
+        cleanup();
+        resolve({
+          ok,
+          streamActive: stream.active,
+          readyState: video.readyState,
+          videoWidth: video.videoWidth,
+          videoHeight: video.videoHeight,
+          playbackError: lastPlaybackError,
+        });
       };
 
-      if (video.readyState >= 1) {
-        onReady();
-      } else {
-        video.addEventListener('loadedmetadata', onReady);
-        video.addEventListener('canplay', onReady);
-        // Safety timeout so loading state can never hang forever
-        setTimeout(() => {
-          video.play().catch(() => {}).finally(done);
-        }, 1800);
-      }
+      const checkReady = async () => {
+        if (!mountedRef.current || streamRef.current !== stream) {
+          finish(false);
+          return;
+        }
+        if (video.readyState >= 1 && video.paused) {
+          await tryPlay();
+        }
+        if (
+          stream.active &&
+          video.readyState >= 2 &&
+          video.videoWidth > 0 &&
+          video.videoHeight > 0 &&
+          !video.paused
+        ) {
+          finish(true);
+        }
+      };
+
+      const handleEvent = () => {
+        void checkReady();
+      };
+
+      video.addEventListener('loadedmetadata', handleEvent);
+      video.addEventListener('loadeddata', handleEvent);
+      video.addEventListener('canplay', handleEvent);
+      video.addEventListener('playing', handleEvent);
+      video.addEventListener('resize', handleEvent);
+
+      pollId = setInterval(() => {
+        void checkReady();
+      }, 100);
+
+      // Final check after 4.5 seconds so UI never hangs indefinitely
+      timeoutId = setTimeout(async () => {
+        await checkReady();
+        if (!settled) {
+          const hasLiveFrames =
+            stream.active && video.videoWidth > 0 && video.videoHeight > 0 && video.readyState >= 2;
+          finish(hasLiveFrames);
+        }
+      }, 4500);
+
+      void checkReady();
     });
   }, []);
 
   const startCamera = useCallback(
-    async (preferredMode: 'user' | 'environment' = facingMode) => {
+    async (preferredMode: 'user' | 'environment' = facingModeRef.current, isSwitch = false) => {
       if (isStartingRef.current) return;
 
       if (typeof window !== 'undefined' && !window.isSecureContext) {
+        const diag = await collectDiagnostics({
+          errorName: 'InsecureContext',
+          errorMessage: 'Camera requires HTTPS.',
+        });
+        setCameraDiagnostics(diag);
         setCameraError('Camera requires an HTTPS connection (such as your deployed Vercel URL).');
         return;
       }
 
       if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
+        const diag = await collectDiagnostics({
+          errorName: 'UnsupportedBrowser',
+          errorMessage: 'navigator.mediaDevices.getUserMedia is unavailable.',
+        });
+        setCameraDiagnostics(diag);
         setCameraError(
-          'Your browser does not support live camera access. Please update your browser or upload from gallery.'
+          'Your browser does not support live camera access. Please open in Safari/Chrome or upload from gallery.'
         );
         return;
       }
@@ -268,54 +468,99 @@ export const CameraPage: React.FC = () => {
       isStartingRef.current = true;
       setCameraLoading(true);
       setCameraError(null);
+      setShowDiagnostics(false);
 
-      // Stop existing tracks BEFORE requesting a new camera (required on Android)
+      // Preserve the previous deviceId before stopping tracks (helpful if enumerateDevices fallback is needed)
+      const previousDeviceId = currentDeviceIdRef.current;
+
+      // Stop existing tracks BEFORE requesting a new camera (required on Android/iOS hardware)
       stopAllTracks();
-
-      const attemptConstraints: MediaStreamConstraints[] = [
-        // 1. Exact facingMode (helps iOS/Android reliably switch front/rear cameras)
-        {
-          video: {
-            facingMode: { exact: preferredMode },
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
-          },
-          audio: false,
-        },
-        // 2. Ideal facingMode (smooth fallback for devices with a single camera)
-        {
-          video: {
-            facingMode: { ideal: preferredMode },
-          },
-          audio: false,
-        },
-        // 3. Generic default video camera fallback
-        {
-          video: true,
-          audio: false,
-        },
-      ];
 
       let acquiredStream: MediaStream | null = null;
       let lastError: unknown = null;
 
-      for (const constraints of attemptConstraints) {
+      const tryConstraints = async (constraints: MediaStreamConstraints): Promise<MediaStream | null> => {
         try {
-          acquiredStream = await navigator.mediaDevices.getUserMedia(constraints);
-          if (acquiredStream) break;
+          return await navigator.mediaDevices.getUserMedia(constraints);
         } catch (err) {
           lastError = err;
-          const errName = (err as { name?: string } | null)?.name || '';
-          // If permission explicitly denied or hardware locked, don't loop further
-          if (
-            errName === 'NotAllowedError' ||
-            errName === 'PermissionDeniedError' ||
-            errName === 'SecurityError' ||
-            errName === 'NotReadableError' ||
-            errName === 'TrackStartError'
-          ) {
-            break;
+          return null;
+        }
+      };
+
+      const isFatalPermissionOrHardwareError = (err: unknown) => {
+        const errName = (err as { name?: string } | null)?.name || '';
+        return (
+          errName === 'NotAllowedError' ||
+          errName === 'PermissionDeniedError' ||
+          errName === 'SecurityError' ||
+          errName === 'NotReadableError' ||
+          errName === 'TrackStartError'
+        );
+      };
+
+      if (!isSwitch) {
+        // 1. Primary initial request: simple gesture-safe front camera request (audio: false)
+        acquiredStream = await tryConstraints({
+          video: { facingMode: preferredMode },
+          audio: false,
+        });
+
+        // 2. Fallback to generic video: true if facingMode constraint failed
+        if (!acquiredStream && !isFatalPermissionOrHardwareError(lastError)) {
+          acquiredStream = await tryConstraints({
+            video: true,
+            audio: false,
+          });
+        }
+      } else {
+        // Switching between front and rear cameras:
+        // 1. Try exact facingMode first so dual-lens phones actually swap cameras
+        acquiredStream = await tryConstraints({
+          video: { facingMode: { exact: preferredMode } },
+          audio: false,
+        });
+
+        // 2. Fallback via enumerateDevices() to pick a matching front/rear deviceId
+        if (
+          !acquiredStream &&
+          !isFatalPermissionOrHardwareError(lastError) &&
+          typeof navigator.mediaDevices.enumerateDevices === 'function'
+        ) {
+          try {
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            const videoInputs = devices.filter((d) => d.kind === 'videoinput');
+            const targetRegex =
+              preferredMode === 'environment'
+                ? /back|rear|environment|world|truedepth/i
+                : /front|user|facetime|selfie/i;
+            const matched =
+              videoInputs.find((d) => targetRegex.test(d.label) && d.deviceId !== previousDeviceId) ||
+              videoInputs.find((d) => d.deviceId && d.deviceId !== previousDeviceId);
+
+            if (matched?.deviceId) {
+              acquiredStream = await tryConstraints({
+                video: { deviceId: { exact: matched.deviceId } },
+                audio: false,
+              });
+            }
+          } catch {
+            // Continue to simpler fallback constraints
           }
+        }
+
+        // 3. Soft facingMode fallback -> generic video: true fallback
+        if (!acquiredStream && !isFatalPermissionOrHardwareError(lastError)) {
+          acquiredStream = await tryConstraints({
+            video: { facingMode: preferredMode },
+            audio: false,
+          });
+        }
+        if (!acquiredStream && !isFatalPermissionOrHardwareError(lastError)) {
+          acquiredStream = await tryConstraints({
+            video: true,
+            audio: false,
+          });
         }
       }
 
@@ -326,6 +571,12 @@ export const CameraPage: React.FC = () => {
       }
 
       if (!acquiredStream) {
+        const errObj = lastError as { name?: string; message?: string } | null;
+        const diag = await collectDiagnostics({
+          errorName: errObj?.name || 'UnknownCameraError',
+          errorMessage: errObj?.message || 'getUserMedia failed',
+        });
+        setCameraDiagnostics(diag);
         setCameraActive(false);
         setCameraLoading(false);
         setCameraError(getCameraErrorMessage(lastError));
@@ -336,16 +587,17 @@ export const CameraPage: React.FC = () => {
       try {
         streamRef.current = acquiredStream;
 
-        // Detect actual facingMode returned by device
         const videoTrack = acquiredStream.getVideoTracks()[0];
         const settings = videoTrack?.getSettings?.();
-        if (settings?.facingMode === 'user' || settings?.facingMode === 'environment') {
-          setFacingMode(settings.facingMode);
-        } else {
-          setFacingMode(preferredMode);
-        }
+        currentDeviceIdRef.current = settings?.deviceId || null;
 
-        // Handle unexpected track end (e.g., OS revoked camera)
+        const resolvedMode =
+          settings?.facingMode === 'user' || settings?.facingMode === 'environment'
+            ? settings.facingMode
+            : preferredMode;
+        facingModeRef.current = resolvedMode;
+        setFacingMode(resolvedMode);
+
         if (videoTrack) {
           videoTrack.onended = () => {
             if (mountedRef.current) {
@@ -354,11 +606,63 @@ export const CameraPage: React.FC = () => {
           };
         }
 
+        // Attach stream and verify videoWidth > 0 && videoHeight > 0 BEFORE marking active
+        const attachResult = await attachStreamToVideo(acquiredStream);
+
+        if (!mountedRef.current) {
+          stopAllTracks();
+          isStartingRef.current = false;
+          return;
+        }
+
+        if (
+          !attachResult.ok ||
+          !attachResult.streamActive ||
+          attachResult.videoWidth <= 0 ||
+          attachResult.videoHeight <= 0
+        ) {
+          const diag = await collectDiagnostics({
+            streamActive: attachResult.streamActive,
+            readyState: attachResult.readyState,
+            videoWidth: attachResult.videoWidth,
+            videoHeight: attachResult.videoHeight,
+            playbackError: attachResult.playbackError,
+            errorName: 'VideoRenderTimeout',
+            errorMessage:
+              attachResult.playbackError ||
+              `Video dimensions remained ${attachResult.videoWidth}x${attachResult.videoHeight} (readyState ${attachResult.readyState}).`,
+          });
+          stopAllTracks();
+          setCameraDiagnostics(diag);
+          setCameraActive(false);
+          setCameraLoading(false);
+          setCameraError(
+            getCameraErrorMessage(
+              { name: 'AbortError', message: diag.errorMessage || undefined },
+              attachResult.playbackError
+            )
+          );
+          isStartingRef.current = false;
+          return;
+        }
+
+        const successDiag = await collectDiagnostics({
+          streamActive: attachResult.streamActive,
+          readyState: attachResult.readyState,
+          videoWidth: attachResult.videoWidth,
+          videoHeight: attachResult.videoHeight,
+        });
+        setCameraDiagnostics(successDiag);
         setCameraActive(true);
-        await attachStreamToVideo(acquiredStream);
         setCameraLoading(false);
       } catch (err) {
+        const errObj = err as { name?: string; message?: string } | null;
+        const diag = await collectDiagnostics({
+          errorName: errObj?.name || 'StreamAttachError',
+          errorMessage: errObj?.message || 'Unexpected camera failure',
+        });
         stopAllTracks();
+        setCameraDiagnostics(diag);
         setCameraActive(false);
         setCameraLoading(false);
         setCameraError(getCameraErrorMessage(err));
@@ -366,14 +670,14 @@ export const CameraPage: React.FC = () => {
         isStartingRef.current = false;
       }
     },
-    [facingMode, stopAllTracks, attachStreamToVideo]
+    [stopAllTracks, attachStreamToVideo, collectDiagnostics]
   );
 
   // Re-attach live stream to <video> whenever returning from Snap Editor (Retake)
   useEffect(() => {
     if (!captured && cameraActive && streamRef.current && videoRef.current) {
-      if (videoRef.current.srcObject !== streamRef.current) {
-        attachStreamToVideo(streamRef.current);
+      if (videoRef.current.srcObject !== streamRef.current || videoRef.current.paused) {
+        void attachStreamToVideo(streamRef.current);
       }
     }
   }, [captured, cameraActive, attachStreamToVideo]);
@@ -452,26 +756,34 @@ export const CameraPage: React.FC = () => {
     };
   }, [cameraActive, activeFilter.lensType]);
 
-  // Overlay Canvas Render Loop (draws Canvas pixel effects or Face Lenses over the visible <video>)
+  // Overlay Canvas Render Loop (only runs when camera is active and canvas pixel effects or lenses are selected)
   const needsCanvasPixelDraw = Boolean(
     activeFilter.canvasMode && activeFilter.canvasMode !== 'none'
   );
 
   useEffect(() => {
-    if (captured) return;
+    const canvas = previewCanvasRef.current;
+    if (captured || !cameraActive || (!needsCanvasPixelDraw && !activeFilter.lensType)) {
+      if (canvas) {
+        const ctx = canvas.getContext('2d');
+        ctx?.clearRect(0, 0, canvas.width, canvas.height);
+      }
+      return;
+    }
+
     let rafId = 0;
 
     const render = (timeMs: number) => {
-      const canvas = previewCanvasRef.current;
-      if (canvas) {
-        const ctx = canvas.getContext('2d');
+      const targetCanvas = previewCanvasRef.current;
+      if (targetCanvas) {
+        const ctx = targetCanvas.getContext('2d');
         if (ctx) {
-          const w = canvas.width;
-          const h = canvas.height;
+          const w = targetCanvas.width;
+          const h = targetCanvas.height;
           ctx.clearRect(0, 0, w, h);
 
           const vid = videoRef.current;
-          if (cameraActive && vid && vid.readyState >= 2 && vid.videoWidth > 0) {
+          if (vid && vid.readyState >= 2 && vid.videoWidth > 0) {
             if (needsCanvasPixelDraw) {
               const vw = vid.videoWidth;
               const vh = vid.videoHeight;
@@ -496,8 +808,7 @@ export const CameraPage: React.FC = () => {
             }
           }
 
-          // Draw Face Lens Overlay cleanly over live camera (or standby preview)
-          if (cameraActive && activeFilter.lensType) {
+          if (activeFilter.lensType) {
             const faceBox: FaceBox = detectedFaceRef.current || {
               x: w * 0.28,
               y: h * 0.27,
@@ -645,12 +956,11 @@ export const CameraPage: React.FC = () => {
 
       const canvas = previewCanvasRef.current;
       const shouldUseCanvasStream =
-        (needsCanvasPixelDraw || Boolean(activeFilter.lensType)) &&
+        needsCanvasPixelDraw &&
         canvas &&
         typeof canvas.captureStream === 'function';
 
       if (shouldUseCanvasStream && canvas) {
-        // Ensure full video frame is on canvas when lens-only
         const cStream = canvas.captureStream(30);
         const tracks = [...cStream.getVideoTracks()];
         if (audioTrack) tracks.push(audioTrack);
@@ -666,6 +976,7 @@ export const CameraPage: React.FC = () => {
         ? new MediaRecorder(combinedStream, { mimeType: preferredMime })
         : new MediaRecorder(combinedStream);
 
+      const startedAt = Date.now();
       recordedChunksRef.current = [];
       recorder.ondataavailable = (e) => {
         if (e.data && e.data.size > 0) recordedChunksRef.current.push(e.data);
@@ -681,7 +992,7 @@ export const CameraPage: React.FC = () => {
           blob,
           url,
           mimeType: finalMime,
-          duration: Math.max(1, recordSec),
+          duration: Math.max(1, Math.round((Date.now() - startedAt) / 1000)),
         });
       };
 
@@ -695,11 +1006,11 @@ export const CameraPage: React.FC = () => {
 
   const handleShutterPress = () => {
     if (!cameraActive) {
-      startCamera(facingMode);
+      void startCamera(facingModeRef.current, false);
       return;
     }
     if (captureMode === 'video') {
-      toggleVideoRecording();
+      void toggleVideoRecording();
       return;
     }
     if (timerSec === 0) {
@@ -722,11 +1033,12 @@ export const CameraPage: React.FC = () => {
 
   const handleSwitchCamera = () => {
     if (cameraLoading || isStartingRef.current) return;
-    const nextMode = facingMode === 'user' ? 'environment' : 'user';
+    const nextMode = facingModeRef.current === 'user' ? 'environment' : 'user';
+    facingModeRef.current = nextMode;
     setFacingMode(nextMode);
     setFlashOn(false);
     if (cameraActive) {
-      startCamera(nextMode);
+      void startCamera(nextMode, true);
     }
   };
 
@@ -1249,24 +1561,29 @@ export const CameraPage: React.FC = () => {
     );
   }
 
-  const videoTransform = `${facingMode === 'user' && state.settings.mirrorFrontCam ? 'scaleX(-1) ' : ''}scale(${zoom})`;
+  const videoTransformParts: string[] = [];
+  if (facingMode === 'user' && state.settings.mirrorFrontCam) {
+    videoTransformParts.push('scaleX(-1)');
+  }
+  if (zoom !== 1) {
+    videoTransformParts.push(`scale(${zoom})`);
+  }
+  const videoTransform = videoTransformParts.join(' ');
 
   // LIVE CAMERA & FILTER STUDIO VIEW
   return (
     <div className="relative h-full w-full bg-black flex flex-col items-center justify-center overflow-hidden touch-none overscroll-none select-none">
       <div className="relative w-full h-full max-w-[460px] lg:max-w-[520px] lg:h-[calc(100%-24px)] lg:rounded-3xl lg:border lg:border-[#292929] overflow-hidden bg-[#0A0A0A] shadow-2xl">
-        {/* Visible Native Video Element (never display:none so iOS Safari & Android Chrome decode frames cleanly) */}
+        {/* Always-visible Native Video Element (never display:none or opacity:0 so iOS Safari & Android Chrome decode and display frames immediately) */}
         <video
           ref={videoRef}
           autoPlay
           muted
           playsInline
-          className={`absolute inset-0 w-full h-full object-cover transition-opacity duration-200 ${
-            cameraActive ? 'opacity-100' : 'opacity-0 pointer-events-none'
-          }`}
+          className="absolute inset-0 w-full h-full object-cover bg-[#0A0A0A]"
           style={{
             filter: activeFilter.cssFilter !== 'none' ? activeFilter.cssFilter : undefined,
-            transform: videoTransform,
+            transform: videoTransform || undefined,
           }}
         />
 
@@ -1321,9 +1638,19 @@ export const CameraPage: React.FC = () => {
               <Search className="w-4 h-4" />
             </button>
             {cameraActive && (
-              <div className="px-2.5 py-1 rounded-full bg-black/65 border border-[#FFFC00]/40 text-[11px] font-bold text-[#FFFC00] flex items-center gap-1.5">
-                <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
-                {isRecording ? `REC ${recordSec}s` : facingMode === 'user' ? 'FRONT CAM' : 'REAR CAM'}
+              <div className="flex items-center gap-1.5">
+                <div className="px-2.5 py-1 rounded-full bg-black/65 border border-[#FFFC00]/40 text-[11px] font-bold text-[#FFFC00] flex items-center gap-1.5">
+                  <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
+                  {isRecording ? `REC ${recordSec}s` : facingMode === 'user' ? 'FRONT CAM' : 'REAR CAM'}
+                </div>
+                <button
+                  onClick={stopCamera}
+                  className="w-8 h-8 rounded-full bg-black/65 border border-white/15 text-white flex items-center justify-center hover:border-[#FFFC00]"
+                  aria-label="Close camera"
+                  title="Close Camera"
+                >
+                  <X className="w-4 h-4" />
+                </button>
               </div>
             )}
           </div>
@@ -1386,10 +1713,12 @@ export const CameraPage: React.FC = () => {
 
         {/* Camera Loading State */}
         {cameraLoading && (
-          <div className="absolute inset-0 z-20 bg-black/75 backdrop-blur-sm flex flex-col items-center justify-center gap-3 p-6 text-center">
+          <div className="absolute inset-0 z-20 bg-black/65 backdrop-blur-sm flex flex-col items-center justify-center gap-3 p-6 text-center pointer-events-auto">
             <Loader2 className="w-9 h-9 text-[#FFFC00] animate-spin" />
-            <p className="text-sm font-bold text-white">Starting camera...</p>
-            <p className="text-xs text-[#A1A1A1]">Approve browser camera permission if prompted.</p>
+            <p className="text-sm font-bold text-white">Starting live camera...</p>
+            <p className="text-xs text-[#A1A1A1] max-w-xs">
+              Approve camera permission when prompted and wait for the live video feed to appear.
+            </p>
           </div>
         )}
 
@@ -1402,11 +1731,11 @@ export const CameraPage: React.FC = () => {
                   <div className="w-11 h-11 rounded-2xl bg-red-500/15 border border-red-500/30 flex items-center justify-center mx-auto text-red-400">
                     <AlertCircle className="w-5 h-5" />
                   </div>
-                  <p className="text-sm font-bold text-white">Camera Unavailable</p>
+                  <p className="text-sm font-bold text-white">Camera Not Rendering</p>
                   <p className="text-xs text-[#A1A1A1] leading-relaxed">{cameraError}</p>
                   <div className="flex flex-col gap-2">
                     <button
-                      onClick={() => startCamera(facingMode)}
+                      onClick={() => void startCamera(facingModeRef.current, false)}
                       className="w-full h-11 rounded-xl bg-[#FFFC00] text-black text-xs font-bold flex items-center justify-center gap-2 hover:brightness-95 transition"
                     >
                       <RefreshCw className="w-4 h-4" />
@@ -1420,6 +1749,55 @@ export const CameraPage: React.FC = () => {
                       Upload From Gallery
                     </button>
                   </div>
+
+                  {cameraDiagnostics && (
+                    <div className="pt-1 border-t border-[#292929] text-left">
+                      <button
+                        type="button"
+                        onClick={() => setShowDiagnostics((v) => !v)}
+                        className="w-full flex items-center justify-between text-[11px] font-semibold text-[#A1A1A1] hover:text-white py-1"
+                      >
+                        <span>Camera Diagnostics</span>
+                        {showDiagnostics ? (
+                          <ChevronUp className="w-3.5 h-3.5" />
+                        ) : (
+                          <ChevronDown className="w-3.5 h-3.5" />
+                        )}
+                      </button>
+                      {showDiagnostics && (
+                        <div className="mt-1.5 p-2.5 rounded-xl bg-black/80 border border-[#292929] text-[10px] font-mono text-[#A1A1A1] space-y-1 break-words">
+                          <div>HTTPS: {cameraDiagnostics.isSecureContext ? 'Yes' : 'No'}</div>
+                          <div>
+                            getUserMedia: {cameraDiagnostics.getUserMediaAvailable ? 'Supported' : 'Missing'}
+                          </div>
+                          <div>Permission: {cameraDiagnostics.permissionState}</div>
+                          <div>
+                            Cameras Detected:{' '}
+                            {cameraDiagnostics.cameraCount !== null ? cameraDiagnostics.cameraCount : 'Unknown'}
+                          </div>
+                          <div>
+                            Stream Active:{' '}
+                            {cameraDiagnostics.streamActive !== null
+                              ? String(cameraDiagnostics.streamActive)
+                              : 'null'}
+                          </div>
+                          <div>
+                            Video: {cameraDiagnostics.videoWidth ?? 0}x{cameraDiagnostics.videoHeight ?? 0} (readyState{' '}
+                            {cameraDiagnostics.readyState ?? 0})
+                          </div>
+                          {cameraDiagnostics.errorName && (
+                            <div className="text-red-400">
+                              Error: {cameraDiagnostics.errorName}
+                              {cameraDiagnostics.errorMessage ? ` — ${cameraDiagnostics.errorMessage}` : ''}
+                            </div>
+                          )}
+                          {cameraDiagnostics.playbackError && (
+                            <div className="text-red-400">Playback: {cameraDiagnostics.playbackError}</div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </>
               ) : (
                 <>
@@ -1429,15 +1807,15 @@ export const CameraPage: React.FC = () => {
                   <div>
                     <p className="text-sm font-bold text-white">Camera Ready</p>
                     <p className="text-xs text-[#A1A1A1] leading-relaxed mt-1">
-                      Tap below to activate your device&apos;s live camera for photos, videos, and lenses.
+                      Tap below to activate your live front-facing camera for photos, videos, and lenses.
                     </p>
                   </div>
                   <button
-                    onClick={() => startCamera(facingMode)}
+                    onClick={() => void startCamera('user', false)}
                     className="w-full h-11 rounded-xl bg-[#FFFC00] text-black text-xs font-bold flex items-center justify-center gap-2 hover:brightness-95 transition"
                   >
                     <Camera className="w-4 h-4" />
-                    Enable Live Camera
+                    Enable Camera
                   </button>
                 </>
               )}
@@ -1623,7 +2001,7 @@ export const CameraPage: React.FC = () => {
               className="text-[11px] font-semibold text-[#A1A1A1] hover:text-white flex items-center gap-1 py-1"
             >
               <RotateCcw className="w-3 h-3" />
-              Stop Camera
+              Close Camera
             </button>
           )}
         </div>
