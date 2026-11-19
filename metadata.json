@@ -1,0 +1,6 @@
+{
+  "name": "Lumo",
+  "description": "A Snapchat-inspired social camera, stories, chat, Bitmoji avatar, Spotlight, and Snap Map web experience.",
+  "requestFramePermissions": ["camera", "microphone", "geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
